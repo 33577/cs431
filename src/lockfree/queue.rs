@@ -5,8 +5,9 @@
 //! Michael and Scott.  Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue
 //! Algorithms.  PODC 1996.  <http://dl.acm.org/citation.cfm?id=248106>
 
-use core::mem::{self, MaybeUninit};
+use core::mem::{self};
 use core::sync::atomic::Ordering;
+use std::ptr;
 
 use crossbeam_epoch::{unprotected, Atomic, Guard, Owned, Shared};
 use crossbeam_utils::CachePadded;
@@ -29,13 +30,14 @@ struct Node<T> {
     /// For example, the sentinel node in a queue never contains a value: its slot is always empty.
     /// Other nodes start their life with a push operation and contain a value until it gets popped
     /// out. After that such empty nodes get added to the collector for destruction.
-    data: MaybeUninit<T>,
+    data: Option<T>,
 
     next: Atomic<Node<T>>,
 }
 
 // Any particular `T` should never be accessed concurrently, so no need for `Sync`.
 unsafe impl<T: Send> Sync for Queue<T> {}
+
 unsafe impl<T: Send> Send for Queue<T> {}
 
 impl<T> Default for Queue<T> {
@@ -47,7 +49,7 @@ impl<T> Default for Queue<T> {
 
         // SAFETY: We are creating a new queue, hence have sole ownership of it.
         let sentinel = Owned::new(Node {
-            data: MaybeUninit::uninit(),
+            data: None,
             next: Atomic::null(),
         })
         .into_shared(unsafe { unprotected() });
@@ -67,7 +69,7 @@ impl<T> Queue<T> {
     /// Adds `t` to the back of the queue, possibly waking up threads blocked on `pop()`.
     pub fn push(&self, t: T, guard: &Guard) {
         let new = Owned::new(Node {
-            data: MaybeUninit::new(t),
+            data: Some(t),
             next: Atomic::null(),
         })
         .into_shared(guard);
@@ -155,7 +157,7 @@ impl<T> Queue<T> {
                 // `assume_init_read()`. This is safe as no other thread has access to `data` after
                 // `head` is unreachable, so the ownership of `data` in `next` will never be used
                 // again as it is now a sentinel node.
-                let result = unsafe { next_ref.data.assume_init_read() };
+                let result = unsafe { ptr::read(next_ref.data.as_ref().unwrap()) };
 
                 // SAFETY: `head` is unreachable, and we no longer access `head`. We destroy `head`
                 // after the final access to `next` above to ensure that `next` is also destroyed
@@ -181,7 +183,7 @@ impl<T> Drop for Queue<T> {
         // SAFETY: All non-null nodes made were valid, and we have unique ownership via `&mut self`.
         while let Some(curr) = unsafe { o_curr.try_into_owned() }.map(Owned::into_box) {
             // SAFETY: Not sentinel node, so `data` is valid.
-            drop(unsafe { curr.data.assume_init() });
+            drop(curr.data);
             o_curr = curr.next;
         }
     }
